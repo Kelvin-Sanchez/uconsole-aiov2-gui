@@ -1,0 +1,10 @@
+# Claude Code machine-local approvals (per-checkout, not shared)
+.claude/settings.local.json
+
+# Machine-specific MCP config (contains this dev box's device SSH target)
+.mcp.json
+
+# OS / editor noise
+.DS_Store
+*.swp
+*~
