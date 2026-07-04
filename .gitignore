@@ -4,6 +4,12 @@
 # Machine-specific MCP config (contains this dev box's device SSH target)
 .mcp.json
 
+# Godot import cache (regenerated on open)
+.godot/
+
+# Internal dev backlog — kept locally, not published
+FEATURES.md
+
 # OS / editor noise
 .DS_Store
 *.swp
