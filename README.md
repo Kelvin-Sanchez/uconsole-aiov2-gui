@@ -11,6 +11,21 @@ Per-rail **Launch** menu (programs are configurable — see below):
 
 ![Launch menu](docs/screenshot-launch.png)
 
+## Themes
+
+Pick a theme in **Settings** (persisted to `config.json`):
+
+- **Instrument** (default) — the field-radio instrument panel shown above.
+- **Sonar (goofy)** — rail cards orbit a sonar scope, with a submarine ping
+  every few seconds.
+- **Cubes (goofy 3D)** — every rail card is textured onto all six faces of a
+  floating 3D cube. Drag a cube (touch or mouse) to spin it; let go and it
+  drifts back into a slow tumble. Taps are re-projected onto the face you hit,
+  so toggles and buttons work from any face at any rotation.
+
+In the goofy themes a stationary **Settings** button stays in the top-left
+corner as the escape hatch back to a sensible UI.
+
 ## Platform
 
 Built for the uConsole (CM5) + HackerGadgets AIO v2, running a DragonOS / Debian-based
@@ -58,8 +73,8 @@ To launch automatically on the device's desktop, add to `~/.config/labwc/autosta
 ## Configuration
 
 Settings persist to `~/.config/radio-ui/config.json`: which rails are shown, the
-protected management interface, per-rail power-on-at-boot state, and the **launcher**
-program lists. Add your own programs per rail — each entry has a `label`, a `cmd`, and a
+protected management interface, per-rail power-on-at-boot state, the theme, and the
+**launcher** program lists. Add your own programs per rail — each entry has a `label`, a `cmd`, and a
 `headless` flag:
 
 ```json
