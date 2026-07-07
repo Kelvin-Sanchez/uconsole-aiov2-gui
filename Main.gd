@@ -10,6 +10,9 @@ const REFRESH_SEC := 4.0
 
 const AVAILABLE_RAILS := ["SDR", "GPS", "LORA", "USB"]
 
+# Theme ids, in the order they appear in the Settings dropdown.
+const THEMES := ["instrument", "sonar", "cubes"]
+
 # Short descriptive subtitle per rail (cosmetic).
 const RAIL_SUB := {
 	"SDR": "RTL-SDR - swradio0",
@@ -39,6 +42,7 @@ var config := {
 	"management_interface": "",
 	"launchers": DEFAULT_LAUNCHERS.duplicate(true),
 	"launch_headless_only": false,
+	"theme": "instrument",
 }
 
 # ---- field-radio instrument palette ----
@@ -65,6 +69,21 @@ var content: VBoxContainer
 var settings_layer: Control
 var refresh_timer: Timer
 var _hostname := ""
+# sonar (goofy) theme
+var sonar_layer: Control
+var sonar_scope
+var sonar_cards := []
+var sonar_time := 0.0
+var next_ping := 0.0
+var ping_player: AudioStreamPlayer
+# cubes (goofy 3D) theme
+var cubes_layer: Control
+var cube_world: SubViewport
+var cube_cam: Camera3D
+var cubes := []            # {root, vp, axis, speed, idle_wait}
+var _drag_cube = null      # cubes[] entry currently held by the pointer
+var _drag_moved := false
+var _press_pos := Vector2.ZERO
 # Cached styleboxes keyed by on/off — these are static, so build once and share
 # across all controls instead of reallocating every refresh.
 var _sb_led := {}
@@ -95,6 +114,10 @@ func _ready() -> void:
 	sans.font_names = PackedStringArray(["DejaVu Sans", "Noto Sans", "sans-serif"])
 
 	theme = _build_theme()
+
+	ping_player = AudioStreamPlayer.new()
+	ping_player.stream = _make_ping()
+	add_child(ping_player)
 
 	var bg := ColorRect.new()
 	bg.color = pal.ground
@@ -197,6 +220,8 @@ func load_config() -> void:
 		config["launchers"] = data["launchers"]
 	if data.has("launch_headless_only"):
 		config["launch_headless_only"] = bool(data["launch_headless_only"])
+	if data.has("theme"):
+		config["theme"] = str(data["theme"])
 
 func save_config() -> void:
 	DirAccess.make_dir_recursive_absolute(OS.get_environment("HOME") + "/.config/radio-ui")
@@ -361,10 +386,38 @@ func _make_toggle(rail: String, on: bool) -> Button:
 func build_ui() -> void:
 	for c in content.get_children():
 		c.queue_free()
+	if sonar_layer:
+		sonar_layer.queue_free()
+		sonar_layer = null
+	sonar_cards.clear()
+	if cubes_layer:
+		cubes_layer.queue_free()
+		cubes_layer = null
+	cubes.clear()
+	cube_world = null
+	cube_cam = null
+	_drag_cube = null
 	rail_widgets.clear()
+	# null all per-build node refs so refresh_state() skips freed ones
 	mgmt_pill = null
 	mgmt_led = null
+	src_val = null
+	draw_val = null
+	temp_val = null
+	batt_val = null
+	batt_fill = null
+	status_label = null
+	host_label = null
+	link_dot = null
+	var th: String = config.get("theme", "instrument")
+	if th == "sonar":
+		_build_sonar()
+	elif th == "cubes":
+		_build_cubes()
+	else:
+		_build_instrument()
 
+func _build_instrument() -> void:
 	content.add_child(_build_topbar())
 
 	var rails := HBoxContainer.new()
@@ -379,6 +432,52 @@ func build_ui() -> void:
 	content.add_child(rails)
 
 	content.add_child(_build_statusbar())
+
+func _build_sonar() -> void:
+	sonar_layer = Control.new()
+	sonar_layer.set_anchors_preset(Control.PRESET_FULL_RECT)
+	sonar_layer.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	add_child(sonar_layer)
+
+	var bg := ColorRect.new()
+	bg.color = Color(0.02, 0.06, 0.05)
+	bg.set_anchors_preset(Control.PRESET_FULL_RECT)
+	bg.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	sonar_layer.add_child(bg)
+
+	sonar_scope = SonarScope.new()
+	sonar_scope.set_anchors_preset(Control.PRESET_FULL_RECT)
+	sonar_scope.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	sonar_layer.add_child(sonar_scope)
+
+	var feed := management_feed_rail()
+	var mi: String = config.get("management_interface", "")
+	var count: int = config["enabled_rails"].size() + (1 if mi != "" else 0)
+	var idx := 0
+	for r in config["enabled_rails"]:
+		var card := _make_rail_card(r, feed)
+		_sonarize(card, idx, count)
+		sonar_layer.add_child(card)
+		idx += 1
+	if mi != "":
+		var mcard := _make_mgmt_card(mi)
+		_sonarize(mcard, idx, count)
+		sonar_layer.add_child(mcard)
+
+	# stationary escape hatch (doesn't orbit) so the user can get back to Settings
+	var gear := Button.new()
+	gear.text = "Settings"
+	gear.custom_minimum_size = Vector2(120, 40)
+	gear.position = Vector2(26, 24)
+	gear.pressed.connect(open_settings)
+	sonar_layer.add_child(gear)
+	var hint := _make_label("SONAR MODE - tap Settings to change theme", 13, Color(0.4, 0.9, 0.6))
+	hint.position = Vector2(26, 92)   # clear of the ~57px-tall Settings button above
+	sonar_layer.add_child(hint)
+
+func _sonarize(card: Control, i: int, n: int) -> void:
+	card.custom_minimum_size = Vector2(200, 220)
+	sonar_cards.append({"card": card, "base": TAU * float(i) / float(max(n, 1))})
 
 func _build_topbar() -> Control:
 	var bar := HBoxContainer.new()
@@ -904,6 +1003,21 @@ func open_settings() -> void:
 		boot_grid.add_child(cb)
 	vbox.add_child(boot_grid)
 
+	var theme_row := HBoxContainer.new()
+	theme_row.add_theme_constant_override("separation", 12)
+	var theme_lbl := _make_label("Theme", 14, pal.text_dim)
+	theme_lbl.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	theme_row.add_child(theme_lbl)
+	var theme_opt := OptionButton.new()
+	theme_opt.custom_minimum_size = Vector2(0, 40)
+	theme_opt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	theme_opt.add_item("Instrument")
+	theme_opt.add_item("Sonar (goofy)")
+	theme_opt.add_item("Cubes (goofy 3D)")
+	theme_opt.selected = maxi(THEMES.find(config.get("theme", "instrument")), 0)
+	theme_row.add_child(theme_opt)
+	vbox.add_child(theme_row)
+
 	var btns := HBoxContainer.new()
 	btns.add_theme_constant_override("separation", 16)
 	var rtc_btn := Button.new()
@@ -935,6 +1049,7 @@ func open_settings() -> void:
 		config["enabled_rails"] = er
 		var meta = opt.get_item_metadata(opt.selected)
 		config["management_interface"] = str(meta) if meta != null else ""
+		config["theme"] = THEMES[theme_opt.selected]
 		for rr in AVAILABLE_RAILS:
 			run_cmd(RAIL_CTL, ["--boot-rail", rr, "on" if boot_checks[rr].button_pressed else "off"])
 		save_config()
@@ -954,8 +1069,306 @@ func _exit_tree() -> void:
 	if _measure_thread and _measure_thread.is_started():
 		_measure_thread.wait_to_finish()
 
+# ---------- theme animation (sonar orbit / cube tumble) + sound ----------
+func _process(delta: float) -> void:
+	var th: String = config.get("theme", "instrument")
+	if th == "cubes":
+		for e in cubes:
+			if _drag_cube != null and e.root == _drag_cube.root:
+				continue   # user has hold of this one
+			if e.idle_wait > 0.0:
+				e.idle_wait = maxf(e.idle_wait - delta, 0.0)
+				continue
+			e.root.global_rotate(e.axis, e.speed * delta)
+		return
+	if th != "sonar" or sonar_cards.is_empty():
+		return
+	sonar_time += delta
+	var cen := size * 0.5
+	var radius: float = min(size.x, size.y) * 0.3
+	for e in sonar_cards:
+		var card: Control = e.card
+		var ang: float = e.base + sonar_time * 0.5
+		card.pivot_offset = card.size * 0.5
+		card.rotation = ang + PI * 0.5
+		card.position = cen + Vector2(cos(ang), sin(ang)) * radius - card.size * 0.5
+	next_ping -= delta
+	if next_ping <= 0.0:
+		next_ping = 3.5
+		if ping_player:
+			ping_player.play()
+		if sonar_scope:
+			sonar_scope.ping_r = 0.0
+
+func _make_ping() -> AudioStreamWAV:
+	# Submarine sonar "pwiiing": a sustained pure sine that rings out slowly,
+	# with a faint delayed echo for underwater depth.
+	var sr := 44100.0
+	var w := AudioStreamWAV.new()
+	w.format = AudioStreamWAV.FORMAT_16_BITS
+	w.mix_rate = int(sr)
+	w.stereo = false
+	var dur := 1.7
+	var f := 690.0                       # ping pitch
+	var n := int(sr * dur)
+	var b := PackedByteArray()
+	b.resize(n * 2)
+	for i in n:
+		var t := float(i) / sr
+		var atk: float = clamp(t / 0.006, 0.0, 1.0)   # ~6ms attack
+		var s := sin(TAU * f * t) * atk * exp(-t * 2.1)   # long ringing tail
+		var te := t - 0.20                                # faint echo
+		if te > 0.0:
+			s += 0.3 * sin(TAU * f * te) * clamp(te / 0.006, 0.0, 1.0) * exp(-te * 2.1)
+		b.encode_s16(i * 2, int(clamp(s * 0.5, -1.0, 1.0) * 32767.0))
+	w.data = b
+	return w
+
+# ---------- cubes (goofy 3D) theme ----------
+# Each rail card renders into its own SubViewport; that texture is pasted on all
+# six faces of a 3D cube. Drag a cube to spin it, tap a face to click through to
+# the card's controls (taps are re-projected into the card's viewport).
+const CUBE_TEX := 256      # px, square render target per card
+const CUBE_SPACING := 2.9  # world units between cube centres (cube is 2 wide)
+
+func _build_cubes() -> void:
+	cubes_layer = Control.new()
+	cubes_layer.set_anchors_preset(Control.PRESET_FULL_RECT)
+	add_child(cubes_layer)
+
+	var bg := ColorRect.new()
+	bg.color = Color(0.045, 0.03, 0.09)
+	bg.set_anchors_preset(Control.PRESET_FULL_RECT)
+	bg.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	cubes_layer.add_child(bg)
+
+	var stars := CubeStars.new()
+	stars.set_anchors_preset(Control.PRESET_FULL_RECT)
+	stars.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	cubes_layer.add_child(stars)
+
+	var svc := SubViewportContainer.new()
+	svc.stretch = true
+	svc.set_anchors_preset(Control.PRESET_FULL_RECT)
+	cubes_layer.add_child(svc)
+
+	cube_world = SubViewport.new()
+	cube_world.own_world_3d = true
+	cube_world.transparent_bg = true
+	svc.add_child(cube_world)
+	svc.gui_input.connect(_cube_gui_input)
+
+	cube_cam = Camera3D.new()
+	cube_cam.position = Vector3(0, 0, 5)
+	cube_cam.fov = 60.0
+	var env := Environment.new()
+	env.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
+	env.ambient_light_color = Color(0.62, 0.62, 0.68)
+	cube_cam.environment = env
+	cube_world.add_child(cube_cam)
+	var light := DirectionalLight3D.new()
+	light.rotation_degrees = Vector3(-35, 25, 0)
+	cube_world.add_child(light)
+
+	var feed := management_feed_rail()
+	var mi: String = config.get("management_interface", "")
+	var count: int = config["enabled_rails"].size() + (1 if mi != "" else 0)
+	var idx := 0
+	for r in config["enabled_rails"]:
+		_add_cube(_make_rail_card(r, feed), idx, count)
+		idx += 1
+	if mi != "":
+		_add_cube(_make_mgmt_card(mi), idx, count)
+
+	# stationary escape hatch (doesn't tumble) so the user can get back to Settings
+	var gear := Button.new()
+	gear.text = "Settings"
+	gear.custom_minimum_size = Vector2(120, 40)
+	gear.position = Vector2(26, 24)
+	gear.pressed.connect(open_settings)
+	cubes_layer.add_child(gear)
+	var hint := _make_label("CUBES MODE - drag a cube to spin it, tap a face to use it", 13, Color(0.75, 0.6, 1.0))
+	hint.position = Vector2(26, 92)
+	cubes_layer.add_child(hint)
+
+func _add_cube(card: Control, i: int, n: int) -> void:
+	var vp := SubViewport.new()
+	vp.size = Vector2i(CUBE_TEX, CUBE_TEX)
+	vp.render_target_update_mode = SubViewport.UPDATE_ALWAYS
+	card.set_anchors_preset(Control.PRESET_FULL_RECT)
+	vp.add_child(card)
+	cube_world.add_child(vp)
+
+	var root := Node3D.new()
+	root.position = Vector3((float(i) - float(n - 1) * 0.5) * CUBE_SPACING, 0.0, 0.0)
+	cube_world.add_child(root)
+
+	var mat := StandardMaterial3D.new()
+	mat.albedo_texture = vp.get_texture()
+	var quad := QuadMesh.new()
+	quad.size = Vector2(2, 2)
+	quad.material = mat
+	# position + rotation of each face; one shared quad mesh, texture on all six
+	var faces := [
+		[Vector3(0, 0, 1), Vector3.ZERO],
+		[Vector3(0, 0, -1), Vector3(0, 180, 0)],
+		[Vector3(1, 0, 0), Vector3(0, 90, 0)],
+		[Vector3(-1, 0, 0), Vector3(0, -90, 0)],
+		[Vector3(0, 1, 0), Vector3(-90, 0, 0)],
+		[Vector3(0, -1, 0), Vector3(90, 0, 0)],
+	]
+	for f in faces:
+		var face := MeshInstance3D.new()
+		face.mesh = quad
+		face.position = f[0]
+		face.rotation_degrees = f[1]
+		root.add_child(face)
+
+	var axis := Vector3(randf() - 0.5, randf() - 0.5, randf() - 0.5)
+	axis = Vector3.UP if axis.length() < 0.01 else axis.normalized()
+	cubes.append({"root": root, "vp": vp, "axis": axis, "speed": 0.25 + randf() * 0.3, "idle_wait": 0.0})
+
+func _cube_gui_input(ev: InputEvent) -> void:
+	if ev is InputEventMouseButton and ev.button_index == MOUSE_BUTTON_LEFT:
+		if ev.pressed:
+			var hit := _cube_ray(ev.position)
+			_drag_cube = hit.get("cube")
+			_drag_moved = false
+			_press_pos = ev.position
+		else:
+			if _drag_cube != null and not _drag_moved:
+				_cube_tap(ev.position)
+			if _drag_cube != null:
+				_drag_cube.idle_wait = 2.5
+			_drag_cube = null
+	elif ev is InputEventMouseMotion and _drag_cube != null:
+		if not _drag_moved and (ev.position - _press_pos).length() > 10.0:
+			_drag_moved = true
+		if _drag_moved:
+			var root: Node3D = _drag_cube.root
+			root.global_rotate(Vector3.UP, ev.relative.x * 0.012)
+			root.global_rotate(Vector3.RIGHT, ev.relative.y * 0.012)
+
+# Analytic ray-pick against each cube's oriented box (local extents -1..1).
+# No physics involved. Returns {} on miss, else {cube, lpoint, lnormal} with the
+# hit point and face normal in the cube's local space.
+func _cube_ray(screen_pos: Vector2) -> Dictionary:
+	if cube_cam == null:
+		return {}
+	var from := cube_cam.project_ray_origin(screen_pos)
+	var dir := cube_cam.project_ray_normal(screen_pos)
+	var best := {}
+	var best_t := INF
+	for e in cubes:
+		var xf: Transform3D = e.root.global_transform
+		var lo := xf.affine_inverse() * from
+		var ld := (xf.basis.inverse() * dir).normalized()
+		var tmin := -INF
+		var tmax := INF
+		var ok := true
+		for ax in 3:
+			if abs(ld[ax]) < 1e-6:
+				if abs(lo[ax]) > 1.0:
+					ok = false
+					break
+				continue
+			var t1 := (-1.0 - lo[ax]) / ld[ax]
+			var t2 := (1.0 - lo[ax]) / ld[ax]
+			tmin = max(tmin, min(t1, t2))
+			tmax = min(tmax, max(t1, t2))
+		if not ok or tmax < max(tmin, 0.0):
+			continue
+		var t := tmin if tmin > 0.0 else tmax
+		if t < best_t:
+			var lp := lo + ld * t
+			var ai := 0
+			for ax in [1, 2]:
+				if abs(lp[ax]) > abs(lp[ai]):
+					ai = ax
+			var ln := Vector3.ZERO
+			ln[ai] = sign(lp[ai])
+			best_t = t
+			best = {"cube": e, "lpoint": lp, "lnormal": ln}
+	return best
+
+# Re-project a tap on a cube face into card-viewport pixels and push a synthetic
+# click, so buttons/toggles on the card work from any face at any rotation.
+func _cube_tap(screen_pos: Vector2) -> void:
+	var hit := _cube_ray(screen_pos)
+	if hit.is_empty():
+		return
+	var lp: Vector3 = hit["lpoint"]
+	var ln: Vector3 = hit["lnormal"]
+	var u: float
+	var v: float
+	if ln.z > 0.5:
+		u = lp.x * 0.5 + 0.5
+		v = 0.5 - lp.y * 0.5
+	elif ln.z < -0.5:
+		u = 0.5 - lp.x * 0.5
+		v = 0.5 - lp.y * 0.5
+	elif ln.x > 0.5:
+		u = 0.5 - lp.z * 0.5
+		v = 0.5 - lp.y * 0.5
+	elif ln.x < -0.5:
+		u = lp.z * 0.5 + 0.5
+		v = 0.5 - lp.y * 0.5
+	elif ln.y > 0.5:
+		u = lp.x * 0.5 + 0.5
+		v = 0.5 + lp.z * 0.5
+	else:
+		u = lp.x * 0.5 + 0.5
+		v = 0.5 - lp.z * 0.5
+	var vp: SubViewport = hit["cube"].vp
+	var pos := Vector2(u, v) * Vector2(vp.size)
+	var press := InputEventMouseButton.new()
+	press.button_index = MOUSE_BUTTON_LEFT
+	press.pressed = true
+	press.position = pos
+	press.global_position = pos
+	vp.push_input(press, true)
+	var release := press.duplicate() as InputEventMouseButton
+	release.pressed = false
+	vp.push_input(release, true)
+
 # ---------- shell helper ----------
 func run_cmd(path: String, args: PackedStringArray) -> String:
 	var out := []
 	OS.execute(path, args, out, true)
 	return "" if out.is_empty() else str(out[0])
+
+# ---------- sonar scope: large static rings behind the orbiting tiles ----------
+# No rotating sweep line — the orbiting tiles are the sweeper. Only an expanding
+# ring pulse on each ping.
+class SonarScope extends Control:
+	var ping_r := -1.0
+	func _process(delta: float) -> void:
+		if ping_r >= 0.0:
+			ping_r += delta * 300.0
+			if ping_r >= min(size.x, size.y) * 0.62:
+				ping_r = -1.0
+			queue_redraw()
+	func _draw() -> void:
+		var c := size * 0.5
+		var maxr: float = min(size.x, size.y) * 0.62
+		var grid := Color(0.16, 0.5, 0.42, 0.5)
+		for i in range(1, 6):
+			draw_arc(c, maxr * float(i) / 5.0, 0.0, TAU, 96, grid, 2.0, true)
+		draw_line(Vector2(c.x - maxr, c.y), Vector2(c.x + maxr, c.y), grid, 1.0)
+		draw_line(Vector2(c.x, c.y - maxr), Vector2(c.x, c.y + maxr), grid, 1.0)
+		if ping_r >= 0.0:
+			draw_arc(c, ping_r, 0.0, TAU, 64, Color(0.45, 1.0, 0.7, 1.0 - ping_r / maxr), 3.0, true)
+
+# ---------- cube stars: static starfield behind the tumbling cubes ----------
+# Fixed seed so the sky doesn't reshuffle on every redraw/resize.
+class CubeStars extends Control:
+	func _notification(what: int) -> void:
+		if what == NOTIFICATION_RESIZED:
+			queue_redraw()
+	func _draw() -> void:
+		var rng := RandomNumberGenerator.new()
+		rng.seed = 0x5DA2
+		for i in 90:
+			var p := Vector2(rng.randf() * size.x, rng.randf() * size.y)
+			var r := 0.6 + rng.randf() * 1.4
+			draw_circle(p, r, Color(0.75, 0.8, 1.0, 0.25 + rng.randf() * 0.5))
